@@ -6,30 +6,33 @@ branding:
 
 inputs:
   input:
-    description: "Path to .pwn source file"
-    required: true
+    description: "Path to .pwn source file (optional, compilation skipped if empty)"
+    required: false
+    default: ""
   output:
     description: "Custom output path (optional)"
     required: false
-  flags:
-    description: "Compiler flags (space separated, e.g. '-;+ -(+ -d3')"
-    required: false
     default: ""
-  include_path:
-    description: "Include paths (space separated, e.g. 'qawno/includes')"
-    required: true
+  flags:
+    description: "Compiler flags (space separated, e.g. '-\\;+ -\\(+ -\\d3')"
+    required: false
+    default: "-\\;+ -\\(+ -d3"
+  includes:
+    description: "Include paths (space separated, e.g. 'qawno/include')"
+    required: false
+    default: "-ipawno/include"
   source_url:
     description: "Pawncc source compiler repository (optional, if empty uses prebuilt binary)"
     required: false
     default: ""
 
 outputs:
+  pawncc:
+    description: "Path to installed pawncc compiler"
+    value: ${{ steps.install.outputs.pawncc }}
   compiled_file:
-    description: "Path to compiled .amx file"
+    description: "Path to compiled .amx file (empty if not compiled)"
     value: ${{ steps.compile.outputs.compiled_file }}
-  compiler_output:
-    description: "Path to compiler output log"
-    value: ${{ steps.compile.outputs.compiler_output }}
 
 runs:
   using: "composite"
@@ -40,28 +43,41 @@ runs:
       run: |
         echo "Installing open.mp pawncc..."
         mkdir -p pawncc
+
         if [ -z "${{ inputs.source_url }}" ]; then
-          # Download prebuilt binary
+          echo "Downloading prebuilt compiler..."
           LATEST_RELEASE=$(curl -s https://api.github.com/repos/openmultiplayer/compiler/releases/latest | grep "browser_download_url.*pawnc-.*linux.tar.gz" | cut -d '"' -f 4 | head -n 1)
           if [ -z "$LATEST_RELEASE" ]; then
             echo "::error::No prebuilt pawnc binary found in latest release"
             exit 1
           fi
-          wget "$LATEST_RELEASE" -O pawnc.tar.gz
+          wget -q "$LATEST_RELEASE" -O pawnc.tar.gz
           tar -xzf pawnc.tar.gz -C pawncc
-          PAWNCC_BINARY=$(find pawncc -type f -name "pawncc" | head -n 1)
-          if [ -z "$PAWNCC_BINARY" ]; then
-            echo "::error::Failed to extract pawncc binary from tar.gz"
-            ls -R pawncc
+          rm pawnc.tar.gz
+
+          # Handle version-specific directory structure
+          COMPILER_DIR=$(find pawncc -maxdepth 1 -type d -name 'pawnc-*' | head -n 1)
+          if [ -n "$COMPILER_DIR" ]; then
+            echo "Found compiler directory: $COMPILER_DIR"
+            mv "$COMPILER_DIR"/* pawncc/
+            rm -r "$COMPILER_DIR"
+          fi
+
+          # Set actual binary path
+          if [ -f "pawncc/bin/pawncc" ]; then
+            PAWNCC_PATH="$(pwd)/pawncc/bin/pawncc"
+          elif [ -f "pawncc/pawncc" ]; then
+            PAWNCC_PATH="$(pwd)/pawncc/pawncc"
+          else
+            echo "::error::Could not locate pawncc binary"
+            find pawncc -type f
             exit 1
           fi
-          mv "$PAWNCC_BINARY" pawncc/pawncc
         else
-          # Install build dependencies
-          sudo apt-get update
-          sudo apt-get install -y gcc gcc-multilib make cmake
-          # Build from source
-          git clone --depth 1 ${{ inputs.source_url }} pawn-src
+          echo "Building compiler from source..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc gcc-multilib make cmake > /dev/null
+          git clone --depth 1 "${{ inputs.source_url }}" pawn-src
           cd pawn-src
           if [ ! -f source/compiler/CMakeLists.txt ]; then
             echo "::error::CMakeLists.txt not found in source/compiler"
@@ -70,51 +86,83 @@ runs:
           fi
           mkdir build && cd build
           cmake ../source/compiler -DCMAKE_C_FLAGS=-m32 -DCMAKE_BUILD_TYPE=Release
-          make
+          make -j$(nproc)
           cd ../..
-          if [ -f "pawn-src/build/pawncc" ]; then
-            mv pawn-src/build/pawncc pawncc/
-          else
-            echo "::error::Compiler binary not found at pawn-src/build/pawncc"
-            ls -R pawn-src
-            exit 1
-          fi
+          mv pawn-src/build/pawncc pawncc/
+          rm -rf pawn-src
+          PAWNCC_PATH="$(pwd)/pawncc/pawncc"
         fi
-        PAWNCC_PATH="$(pwd)/pawncc/pawncc"
+
         if [ -f "$PAWNCC_PATH" ]; then
           chmod +x "$PAWNCC_PATH"
           echo "pawncc=$PAWNCC_PATH" >> $GITHUB_OUTPUT
           echo "Compiler installed at $PAWNCC_PATH"
         else
           echo "::error::Compiler binary not found at $PAWNCC_PATH"
-          ls -R pawncc
+          find pawncc -type f
           exit 1
         fi
 
-- name: Compile Pawn code
-  id: compile
-  shell: bash
-  run: |
-    INPUT_DIR=$(dirname "${{ inputs.input }}")
-    INPUT_FILE=$(basename "${{ inputs.input }}")
-    COMPILE_CMD="${{ steps.install.outputs.pawncc }} ${{ inputs.input }}"
-    if [ -n "${{ inputs.output }}" ]; then
-      COMPILE_CMD="$COMPILE_CMD -o${{ inputs.output }}"
-      OUTPUT_FILE="${{ inputs.output }}"
-    else
-      COMPILE_CMD="$COMPILE_CMD -D${INPUT_DIR}"
-      OUTPUT_FILE="${INPUT_DIR}/${INPUT_FILE%.*}.amx"
-    fi
-    for path in ${{ inputs.include_path }}; do
-      [ -n "$path" ] && COMPILE_CMD="$COMPILE_CMD -i$path"
-    done
-    for flag in ${{ inputs.flags }}; do
-      [ -n "$flag" ] && COMPILE_CMD="$COMPILE_CMD $flag"
-    done
-    echo "Running: $COMPILE_CMD"
-    if ! $COMPILE_CMD > output.pawncc 2>&1; then
-      cat output.pawncc  # Display the compiler output on failure
-      exit 1
-    fi
-    echo "compiled_file=$OUTPUT_FILE" >> $GITHUB_OUTPUT
-    echo "compiler_output=$(pwd)/output.pawncc" >> $GITHUB_OUTPUT
+    - name: Compile Pawn code (conditional)
+      id: compile
+      shell: bash
+      run: |
+        # Set library path for prebuilt compiler
+        export LD_LIBRARY_PATH="$(pwd)/pawncc/lib:$(pwd)/pawncc:$LD_LIBRARY_PATH"
+
+        # Skip compilation if no input file provided
+        if [ -z "${{ inputs.input }}" ]; then
+          echo "::warning::No input file provided. Skipping compilation."
+          echo "compiled_file=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Get absolute path to input file
+        INPUT_PATH=$(realpath "${{ inputs.input }}")
+
+        # Verify input file exists
+        if [ ! -f "$INPUT_PATH" ]; then
+          echo "::error::Input file $INPUT_PATH does not exist"
+          exit 1
+        fi
+
+        INPUT_DIR=$(dirname "$INPUT_PATH")
+        INPUT_FILE=$(basename "$INPUT_PATH")
+        COMPILE_CMD="${{ steps.install.outputs.pawncc }} \"$INPUT_PATH\""
+
+        # Handle output path
+        if [ -n "${{ inputs.output }}" ]; then
+          OUTPUT_PATH=$(realpath -m "${{ inputs.output }}")
+          COMPILE_CMD="$COMPILE_CMD -o\"$OUTPUT_PATH\""
+          OUTPUT_FILE="$OUTPUT_PATH"
+        else
+          OUTPUT_FILE="${INPUT_PATH%.*}.amx"
+          COMPILE_CMD="$COMPILE_CMD -D\"${INPUT_DIR}\""
+        fi
+
+        # Add include paths if provided
+        if [ -n "${{ inputs.includes }}" ]; then
+          for path in ${{ inputs.includes }}; do
+            [ -n "$path" ] && COMPILE_CMD="$COMPILE_CMD -i\"$(realpath -m "$path")\""
+          done
+        fi
+
+        # Add compiler flags if provided
+        if [ -n "${{ inputs.flags }}" ]; then
+          COMPILE_CMD="$COMPILE_CMD ${{ inputs.flags }}"
+        fi
+
+        echo "Running: $COMPILE_CMD"
+        if ! bash -c "$COMPILE_CMD" > output.pawncc 2>&1; then
+          echo "::error::Compilation failed"
+          cat output.pawncc
+          exit 1
+        fi
+
+        # Verify output file exists
+        if [ ! -f "$OUTPUT_FILE" ]; then
+          echo "::error::Compiled file not found at $OUTPUT_FILE"
+          exit 1
+        fi
+
+        echo "compiled_file=$OUTPUT_FILE" >> $GITHUB_OUTPUT
